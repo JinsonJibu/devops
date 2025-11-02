@@ -1,0 +1,138 @@
+# .github/workflows/ci-cd-pipeline.yml
+name: Flask App CI/CD to AKS
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }} 
+  IMAGE_NAME: todo-flask                          
+  IMAGE_TAG: ${{ github.sha }}                    
+  K8S_PATH: kubernetes                            
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: ⬇️ Checkout Repository
+      uses: actions/checkout@v4
+    # .github/workflows/ci-cd-pipeline.yml
+
+# ... (Previous step: Checkout Repository) ...
+
+    - name: 🔬 Run Unit Tests (Pytest)
+      # Uses Python and installs dependencies to run tests locally
+      run: |
+        echo "Setting up Python environment and installing dependencies..."
+        python -m pip install --upgrade pip
+        # Install dependencies from the application's requirements file
+        pip install -r todolist/requirements.txt 
+        
+        echo "Executing Pytest from the todolist directory..."
+        # Run tests against the application code
+        pytest todolist/test_app.py
+        
+# ... (Next step: Azure Login) ...
+
+    # ----------------------------------------------------
+    # 1. CI: Log in to Azure and ACR
+    # ----------------------------------------------------
+    - name: 🔐 Azure Login
+      uses: azure/login@v1 
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+    - name: 🔐 Docker Login to ACR
+      uses: azure/docker-login@v1 
+      with:
+        login-server: ${{ env.ACR_LOGIN_SERVER }}
+        username: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }} 
+        password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }} 
+        
+    # ----------------------------------------------------
+    # 2. CI: Build and Push Docker Image
+    # ----------------------------------------------------
+    - name: 🛠️ Build and Tag Docker Image
+      run: |
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} -f ./todolist/Dockerfile ./todolist 
+
+    - name: ⬆️ Push Docker Image to ACR
+      run: |
+        docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+    # ----------------------------------------------------
+    # 3. CD: Deploy to AKS
+    # ----------------------------------------------------
+    
+    - name: 🤝 Get AKS Credentials
+      uses: azure/aks-set-context@v3 
+      with:
+        resource-group: ${{ secrets.RESOURCE_GROUP }}
+        cluster-name: ${{ secrets.CLUSTER_NAME }}
+
+    - name: ⚙️ Apply K8s Manifests (Create Service & Deployment)
+      run: |
+        kubectl apply -f ${{ env.K8S_PATH }}/service.yaml
+        # --- THIS IS THE FIX ---
+        kubectl apply -f ${{ env.K8S_PATH }}/deployment.yaml 
+
+    - name: 📝 Patch Deployment Image
+      run: |
+        kubectl set image deployment/${{ env.IMAGE_NAME }}-deployment ${{ env.IMAGE_NAME }}-app=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        
+    # # ----------------------------------------------------
+    # # 4. Monitoring and Verification (with Diagnostics)
+    # # ----------------------------------------------------
+    # - name: 🔎 Verify Deployment Health and Get Logs
+    #   run: |
+    #     echo "Waiting for the new pods to roll out (5m timeout)..."
+    #     kubectl rollout status deployment/${{ env.IMAGE_NAME }}-deployment --timeout=5m || echo "Rollout timed out. Collecting diagnostics..."
+        
+    #     echo "--- Pod Status after Rollout ---"
+    #     kubectl get pods -l app=${{ env.IMAGE_NAME }} --show-labels
+        
+    #     echo "--- Kubernetes Events for Deployment ---"
+    #     NEW_REPLICASET_NAME=$(kubectl describe deployment ${{ env.IMAGE_NAME }}-deployment | grep "NewReplicaSet" | awk '{print $2}')
+    #     if [ ! -z "$NEW_REPLICASET_NAME" ]; then
+    #       echo "--- Events for new ReplicaSet ($NEW_REPLICASET_NAME) ---"
+    #       kubectl describe replicaset $NEW_REPLICASET_NAME
+    #     else
+    #       echo "Could not find new ReplicaSet to describe events."
+    #     fi
+        
+    #     echo "--- Logs from a Failing Pod ---"
+    #     POD_NAME=$(kubectl get pods -l app=${{ env.IMAGE_NAME }} -o jsonpath='{.items[0].metadata.name}')
+    #     if [ ! -z "$POD_NAME" ]; then
+    #       echo "--- Logs from *previous* container (if it crashed) ---"
+    #       kubectl logs --previous $POD_NAME || echo "No previous container logs found."
+    #       echo "--- Logs from *current* container ---"
+    #       kubectl logs $POD_NAME
+    #     else
+    #       echo "Could not find a pod name to fetch logs."
+    #     fi
+        
+    #     echo "--- Final LoadBalancer IP Check ---"
+    #     kubectl get service ${{ env.IMAGE_NAME }}-service
+        
+    #     echo "--- Final Rollout Check ---"
+    #     kubectl rollout status deployment/${{ env.IMAGE_NAME }}-deployment --timeout=10s
+
+    # ----------------------------------------------------
+
+# ----------------------------------------------------
+# 4. Monitoring and Verification (Final Robust Version)
+# ----------------------------------------------------
+    - name: 🔎 Verify Deployment and Show IP
+      run: |
+        echo "Waiting for deployment rollout to complete..."
+        # This is the REAL test. If this command fails, the job fails.
+        kubectl rollout status deployment/${{ env.IMAGE_NAME }}-deployment --timeout=3m
+
+        echo "✅ Deployment successful!"
+
+        echo "Fetching service IP (this is for information only)..."
+        # This command will just print the service status.
+        # It will NOT fail the pipeline if the IP is <pending>.
+        kubectl get service ${{ env.IMAGE_NAME }}-service
